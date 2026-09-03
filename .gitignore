@@ -1,0 +1,17 @@
+# Secrets — never commit
+config.py
+.env
+.env.*
+
+# Runtime / local data
+*.log
+logs/
+bot_state.json
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Backtest data
+backtest/*.json
+backtest/*.png
