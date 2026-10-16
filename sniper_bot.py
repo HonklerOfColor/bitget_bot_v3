@@ -18,7 +18,11 @@ from bitget_client import (
     get_ticker,
     get_balance,
     get_position,
+    get_symbol_info,
     place_futures_order,
+    place_limit_order_post_only,
+    get_order_detail,
+    cancel_order,
     set_position_sl_tp,
     set_leverage,
 )
@@ -197,6 +201,17 @@ def get_atr(symbol: str, period: int = 14) -> float:
     return sum(trs[-period:]) / period
 
 
+def get_price_place(symbol: str) -> int:
+    """pricePlace (Preis-Dezimalstellen) aus den Contracts — PFLICHT für Limit-Preise."""
+    try:
+        info = get_symbol_info(symbol)
+        if info.get("code") == "00000" and info.get("data"):
+            return int(info["data"][0].get("pricePlace", 2))
+    except Exception:
+        pass
+    return 2
+
+
 def calculate_size(balance: float, entry: float, sl: float, leverage: int, risk_pct: float) -> float:
     """
     Berechnet die Positionsgröße:
@@ -356,13 +371,82 @@ def open_trade(symbol: str, side: str, leverage: int) -> dict:
     # LONG  → side=buy,  tradeSide=open
     # SHORT → side=sell, tradeSide=open
     buy_sell = "buy" if side == "LONG" else "sell"
+    hold_side = side.lower()
+
+    if config.MAKER_ENTRY:
+        # ── Maker-Entry (MC-Finding 14.09.): Post-Only Limit statt IOC-Market ──
+        # Spart ~⅓ der Fees (Einstieg 0,06% Taker → 0,02% Maker).
+        # Füllt er nicht innerhalb MAKER_TIMEOUT_S, wird das Signal verworfen.
+        ob = get_orderbook(symbol, depth=5)
+        data = ob.get("data", {}) if ob.get("code") == "00000" else {}
+        bids = data.get("bids") or data.get("b") or []
+        asks = data.get("asks") or data.get("a") or []
+        if not bids or not asks:
+            logger.warning(f"  ⚠️ Maker: kein Orderbuch ({ob.get('msg')}) — überspringe")
+            return {"ok": False, "reason": "orderbook leer"}
+        pp = get_price_place(symbol)
+        limit_px = round(float(bids[0][0]) if side == "LONG" else float(asks[0][0]), pp)
+        order = place_limit_order_post_only(symbol, buy_sell, "open", size, limit_px)
+        if order.get("code") != "00000":
+            logger.error(f"Post-Only-Order fehlgeschlagen: {order.get('msg')}")
+            return {"ok": False, "reason": order.get("msg")}
+        _od = order.get("data") or {}
+        order_id = _od.get("orderId") if isinstance(_od, dict) else str(_od)
+        if not order_id:
+            logger.error("Post-Only-Order ohne orderId zurückgekommen")
+            return {"ok": False, "reason": "no_order_id"}
+        logger.info(f"  📄 Post-Only Entry {symbol} {side} {size} @ {limit_px} (ID {order_id}) — warte auf Fill (max {config.MAKER_TIMEOUT_S}s)")
+
+        waited = 0
+        while waited < config.MAKER_TIMEOUT_S:
+            time.sleep(3)
+            waited += 3
+            det = get_order_detail(symbol, order_id)
+            d = det.get("data") or {}
+            if isinstance(d, list):
+                d = d[0] if d else {}
+            state = str(d.get("state", "")).lower()
+            if state == "filled" or state in ("canceled", "cancelled"):
+                break
+
+        # Offenen Rest stornieren (Timeout oder Partial-Fill)
+        try:
+            cancel_order(symbol, order_id)
+        except Exception:
+            pass
+        time.sleep(1)
+
+        # Tatsächliche Position (= Fill) prüfen — Size kann partial sein
+        raw_pos = get_position(symbol)
+        pos_row = None
+        for r in (raw_pos.get("data") or []):
+            if str(r.get("symbol")) == symbol and float(r.get("total", 0) or 0) > 0:
+                pos_row = r
+                break
+        if not pos_row:
+            logger.info(f"  ⏭️ Maker nicht gefüllt ({waited}s) — Signal verworfen")
+            return {"ok": False, "reason": "maker_unfilled"}
+
+        entry_avg = float(pos_row.get("openPriceAvg") or limit_px)
+        filled_size = float(pos_row.get("total", 0) or 0)
+        # SL/TP auf den ECHTEN Fill-Preis rechnen
+        if side == "LONG":
+            sl = entry_avg - sl_dist
+            tp = entry_avg + tp_dist
+        else:
+            sl = entry_avg + sl_dist
+            tp = entry_avg - tp_dist
+        set_position_sl_tp(symbol, hold_side, sl, tp)
+        logger.info(f"✅ Maker-Entry gefüllt: {symbol} {side} {filled_size} @ {entry_avg} (SL {sl:.2f} / TP {tp:.2f})")
+        return {"ok": True, "entry": entry_avg, "sl": sl, "tp": tp, "size": filled_size, "maker": True}
+
+    # Fallback: IOC-Market (alte Methode, per config.MAKER_ENTRY=False aktivierbar)
     order = place_futures_order(symbol, buy_sell, "open", size)
     if order.get("code") != "00000":
         logger.error(f"Order fehlgeschlagen: {order.get('msg')}")
         return {"ok": False, "reason": order.get("msg")}
 
     # Exchange-SL/TP auf der GESAMTEN Position setzen (entire, V1-Methode)
-    hold_side = side.lower()
     set_position_sl_tp(symbol, hold_side, sl, tp)
 
     logger.info(f"✅ Order platziert: {symbol} {side} {size} @ {price}")

@@ -205,6 +205,44 @@ def set_position_sl_tp(symbol: str, hold_side: str, sl_price: float, tp_price: f
     return result
 
 
+def place_limit_order_post_only(symbol: str, side: str, trade_side: str, size: float, price: float) -> dict:
+    """Limit-Order mit Post-Only (Maker) — force=post_only (MC-Finding 14.09.)."""
+    if config.DRY_RUN:
+        logger.info(f"[DRY-RUN] POST-ONLY {side.upper()} {trade_side} {size} {symbol} @ {price}")
+        return {"code": "00000"}
+    return _post("/api/v2/mix/order/place-order", {
+        "symbol": symbol,
+        "productType": config.PRODUCT_TYPE,
+        "marginCoin": config.MARGIN_COIN,
+        "marginMode": config.MARGIN_MODE,
+        "side": side,
+        "tradeSide": trade_side,
+        "orderType": "limit",
+        "price": str(price),
+        "size": str(size),
+        "force": "post_only",
+    })
+
+
+def get_order_detail(symbol: str, order_id: str) -> dict:
+    """Order-Detail (State/Filled) — für die Maker-Entry-Warteschleife."""
+    params = {"symbol": symbol, "productType": config.PRODUCT_TYPE, "orderId": str(order_id)}
+    return _get("/api/v2/mix/order/detail", params)
+
+
+def cancel_order(symbol: str, order_id: str) -> dict:
+    """Storniert eine offene Order."""
+    if config.DRY_RUN:
+        logger.info(f"[DRY-RUN] cancel order {order_id} {symbol}")
+        return {"code": "00000"}
+    return _post("/api/v2/mix/order/cancel-order", {
+        "symbol": symbol,
+        "productType": config.PRODUCT_TYPE,
+        "marginCoin": config.MARGIN_COIN,
+        "orderId": str(order_id),
+    })
+
+
 def close_all_positions(symbol: str) -> dict:
     if config.DRY_RUN:
         logger.info(f"[DRY-RUN] Close all positions {symbol}")
