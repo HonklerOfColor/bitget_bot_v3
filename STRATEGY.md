@@ -1,7 +1,29 @@
 # V3 SNIPER BOT — Strategie & Parameter
 
-> Stand: 10.08.2026 · LIVE-Modus (DEMO_MODE=False, DRY_RUN=False)
+> Stand: 18.10.2026 · **Neue Entries pausiert** (`ENTRIES_PAUSED` default True)
 > Arbeitstitel: Orderbuch-/Tape-Sniper
+
+## 0. Status nach Live-Auswertung (18.10.2026)
+
+346 geschlossene Trades des Subaccounts `at-HNKHNKHNKHNK` (11.08.–17.10.2026):
+brutto **+1,74 USDT** (nicht signifikant, t ≈ 0,6), Fees **−5,91**, Funding **−0,12**, netto **−4,30**.
+Der Brutto-Edge (~0,033 % des Notionals) liegt unter dem realistischen Round-Trip
+(Maker-Entry + Taker-SL/TP ≈ 0,08 %, davor Taker/Taker ≈ 0,12 %).
+Selbst ein Fantasie-Szenario mit Maker auf beiden Seiten bleibt netto negativ.
+
+Symbol-, Stunden- und Notional-Filter, die in-sample besser aussahen (vor allem LONG-only),
+sind out-of-sample (ab 06.09.2026, 104 Trades) klar negativ. Ein 60-Minuten-Zeitstop
+war im Raster einmal OOS leicht positiv, die Nachbar-Horizonte nicht, t ≈ 0,5 — verworfen.
+
+**Konsequenz:** keine neuen Orders, bis eine vorher festgelegte Regel OOS netto positiv ist.
+Wiederaufnehmen nur bewusst: in `config.py` (nicht im Repo) `ENTRIES_PAUSED = False`.
+Die Größen-Gates bleiben dann aktiv und lehnen Orders ab, die unter der Mindestgröße liegen,
+unter 5 USDT Notional fallen, die Margin über 98 % des freien Guthabens treiben oder deren
+TP-Distanz den Round-Trip nicht deckt. Größe wird auf `sizeMultiplier` **abgerundet**, nicht
+mehr mit `round(size, 2)` auf die Mindestorder angehoben.
+
+Kontostand laut Monitor am 18.10.: ~2,39 USDT, keine offene Position, Prozess lief.
+Damit ist jede der fünf Symbol-Mindestorders entweder unter dem Step oder marginfrei nicht zu tragen.
 
 ---
 
@@ -43,6 +65,8 @@ SHORT = Imbalance < 0.7 UND Trend SHORT UND Sweep SHORT
 ---
 
 ## 3. Entry
+
+> Historische Parameter. Live-Stand und Pause: Abschnitt 0. Entry ist Post-Only mit Fill-Timeout, Hebel kommt aus `config.py` (Vorgabe 3×), nicht mehr Market-IOC mit 5×.
 
 | Parameter | Wert |
 |-----------|------|

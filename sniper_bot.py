@@ -11,6 +11,11 @@ import json
 from datetime import datetime
 from loguru import logger
 import config
+from trade_gates import (
+    ContractSpec,
+    calculate_size as gate_calculate_size,
+    evaluate_entry,
+)
 from bitget_client import (
     get_orderbook,
     get_recent_trades,
@@ -44,7 +49,11 @@ logger.add(
     format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
 )
 
-logger.info("🚀 V3 Sniper Bot gestartet (Demo-Modus)")
+logger.info(
+    "🚀 V3 Sniper Bot gestartet | "
+    f"DEMO_MODE={config.DEMO_MODE} DRY_RUN={config.DRY_RUN} "
+    f"ENTRIES_PAUSED={getattr(config, 'ENTRIES_PAUSED', True)}"
+)
 
 # ============================================================
 # Telegram Notify (nur Benachrichtigung, keine Trades)
@@ -213,14 +222,31 @@ def get_price_place(symbol: str) -> int:
 
 
 def calculate_size(balance: float, entry: float, sl: float, leverage: int, risk_pct: float) -> float:
-    """
-    Berechnet die Positionsgröße:
-    size = balance × risk_pct × leverage / (entry − SL)
-    """
-    risk_dist = abs(entry - sl)
-    if risk_dist <= 0:
-        return 0.0
-    return (balance * risk_pct * leverage) / risk_dist
+    """Rohgröße vor Step-Abrundung. Formel lebt in trade_gates.calculate_size."""
+    return gate_calculate_size(balance, entry, sl, leverage, risk_pct)
+
+
+def load_contract_spec(symbol: str):
+    """minTradeNum / sizeMultiplier / minTradeUSDT. None wenn die API nichts Brauchbares liefert."""
+    try:
+        info = get_symbol_info(symbol)
+    except Exception as e:
+        logger.warning(f"  SymbolInfo {symbol}: {e}")
+        return None
+    if info.get("code") != "00000" or not info.get("data"):
+        return None
+    row = info["data"][0]
+    try:
+        return ContractSpec(
+            min_trade_num=float(row.get("minTradeNum") or 0),
+            size_step=float(row.get("sizeMultiplier") or 0),
+            min_notional=float(row.get("minTradeUSDT") or 0),
+            price_place=int(row.get("pricePlace") or 2),
+            volume_place=int(row.get("volumePlace") or 2),
+        )
+    except (TypeError, ValueError) as e:
+        logger.warning(f"  SymbolInfo {symbol} unlesbar: {e}")
+        return None
 
 
 def get_open_positions() -> list:
@@ -311,7 +337,12 @@ def open_trade(symbol: str, side: str, leverage: int) -> dict:
     Öffnet einen Trade bei Signal.
     side = "LONG" oder "SHORT"
     DRY_RUN=True → nur Log/Telegram, keine echte Order.
+    ENTRIES_PAUSED (Default True, solange config nichts anderes setzt) → keine Order.
     """
+    if getattr(config, "ENTRIES_PAUSED", True):
+        logger.warning(f"  ⏸️  {symbol} {side}: Entries pausiert — kein Orderversand")
+        return {"ok": False, "reason": "entries_paused"}
+
     logger.success(f"🎯 SIGNAL: {symbol} {side} — {leverage}x")
 
     # ⚙️ WICHTIG: Hebel VOR der Order setzen (sonst Exchange-Default!)
@@ -344,16 +375,37 @@ def open_trade(symbol: str, side: str, leverage: int) -> dict:
     if bal_raw.get("code") == "00000" and bal_raw.get("data"):
         balance = float(bal_raw["data"][0].get("available", 0))
 
-    size = calculate_size(balance, price, sl, leverage, config.RISK_PCT)
-    if size <= 0:
-        return {"ok": False, "reason": "size_zero"}
+    spec = load_contract_spec(symbol)
+    if spec is None:
+        return {"ok": False, "reason": "no_symbol_info"}
 
-    # Size auf 2 Dezimalstellen runden (Bitget checkScale=2 für min. Orders)
-    size = round(size, 2)
-    if size <= 0:
-        return {"ok": False, "reason": "size_too_small"}
+    # Größe auf den Kontrakt-Step ABRUNDEN. round(..., 2) hat 0.005 auf die
+    # Mindestgröße 0.01 gehoben und damit fast das ganze Konto als Margin gebunden.
+    decision = evaluate_entry(
+        entries_paused=False,
+        balance=balance,
+        price=price,
+        sl_price=sl,
+        tp_price=tp,
+        leverage=leverage,
+        risk_pct=config.RISK_PCT,
+        spec=spec,
+        entry_is_maker=bool(getattr(config, "MAKER_ENTRY", True)),
+    )
+    if not decision.allow:
+        logger.warning(
+            f"  ⛔ kein Order ({decision.reason}) | raw {decision.raw_size:.6f} "
+            f"→ size {decision.size} | notional {decision.notional:.2f} "
+            f"margin {decision.margin:.2f} | balance {balance:.2f} "
+            f"| min {spec.min_trade_num} step {spec.size_step}"
+        )
+        return {"ok": False, "reason": decision.reason}
 
-    logger.info(f"  Entry {price:.2f} | SL {sl:.2f} | TP {tp:.2f} | Size {size} | Balance {balance:.2f}")
+    size = decision.size
+    logger.info(
+        f"  Entry {price:.2f} | SL {sl:.2f} | TP {tp:.2f} | Size {size} "
+        f"(raw {decision.raw_size:.6f}) | Balance {balance:.2f} | Margin {decision.margin:.2f}"
+    )
 
     if config.DRY_RUN:
         # DRY-RUN: nur simulieren
@@ -458,13 +510,31 @@ def open_trade(symbol: str, side: str, leverage: int) -> dict:
 # ============================================================
 
 def run():
-    logger.info("Starte Sniper-Loop (DRY_RUN=True → keine Orders)")
+    entries_paused = getattr(config, "ENTRIES_PAUSED", True)
+    logger.info(
+        f"Starte Sniper-Loop | DRY_RUN={config.DRY_RUN} ENTRIES_PAUSED={entries_paused}"
+    )
+    if entries_paused:
+        logger.warning(
+            "ENTRIES PAUSIERT — 346 Live-Trades Aug–Okt 2026, netto negativ, "
+            "kein OOS-positiver Regelwechsel. Keine neuen Orders. "
+            "Zum Wiederaufnehmen in config.py ENTRIES_PAUSED = False setzen."
+        )
+        tg_send(
+            "⏸️ <b>V3 Sniper pausiert</b>\n"
+            "Keine neuen Entries. 346 Live-Trades netto negativ, "
+            "nach Fees kein belastbarer Edge. Offene SL/TP bleiben unberührt."
+        )
     warn_cooldown = {}  # symbol → letzter Warnungs-Zeitstempel
+    pause_log_ts = time.time()
 
-    # ⚙️ Startup: Hebel für alle Symbole vorbereiten (LONG+SHORT)
-    for sym_cfg in config.SYMBOLS:
-        setup_leverage(sym_cfg["symbol"], sym_cfg["leverage"])
-        time.sleep(0.5)
+    # Hebel nur, wenn wirklich Orders erlaubt sind. Pausiert: Konto nicht anfassen.
+    if not entries_paused:
+        for sym_cfg in config.SYMBOLS:
+            setup_leverage(sym_cfg["symbol"], sym_cfg["leverage"])
+            time.sleep(0.5)
+    else:
+        logger.info("Hebel-Setup übersprungen (Entries pausiert)")
 
     while True:
         try:
@@ -541,6 +611,13 @@ def run():
                     trailing_sl(open_positions)
             except Exception as e:
                 logger.debug(f"  ⚠️ Trailing-Check: {e}")
+
+            if entries_paused and time.time() - pause_log_ts > 3600:
+                pause_log_ts = time.time()
+                logger.warning(
+                    "ENTRIES PAUSIERT — keine neuen Orders "
+                    "(kein belastbarer Edge nach Fees)"
+                )
 
             time.sleep(3)  # 3 Sekunden Takt
 
